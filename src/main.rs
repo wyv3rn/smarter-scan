@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
+    fs::FileType,
     path::PathBuf,
+    process::{Command, ExitStatus},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -8,7 +10,7 @@ use std::{
 use axum::{
     Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
@@ -51,12 +53,20 @@ impl Scans {
         self.scans.insert(scan.id, scan);
     }
 
+    pub fn get_scans(&self) -> Vec<Scan> {
+        self.scans.values().rev().cloned().collect()
+    }
+
     pub fn get_scan(&self, id: &ScanId) -> Option<Scan> {
         self.scans.get(id).cloned()
     }
 
     pub fn get_status(&self, id: &ScanId) -> Option<Status> {
         self.scans.get(id).map(|s| s.status)
+    }
+
+    pub fn get_path(&self, id: &ScanId) -> Option<PathBuf> {
+        self.scans.get(id).map(|s| s.path.clone())
     }
 
     pub fn set_status(&mut self, id: ScanId, s: Status) {
@@ -113,6 +123,7 @@ async fn main() {
         .route("/scans/front/{id}", get(scan_front))
         .route("/scans/back/{id}", get(scan_back))
         .route("/scans/postproc/{id}", get(scan_postproc))
+        .route("/scans/download/{id}", get(download))
         .with_state(db);
 
     println!("Binding to address {}", args.address);
@@ -120,19 +131,39 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn scans(State(_db): StateDb) -> Markup {
+async fn scans(State(db): StateDb) -> Markup {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let now_utc = DateTime::from_timestamp(now as i64, 0).unwrap();
+    let scans = db.get_scans();
     html! {
-        (head_with_refresh(5))
         h1 { "Smarter Scan" }
         hr {}
         p { a href="/scans/new" { "Neuer Scan" } }
         p { "Aktuelle Uhrzeit: " (now_utc) }
         hr {}
+        table {
+            thead {
+                tr {
+                    th { "Scan ID" } th { "Steuerung" }
+                }
+            }
+            tbody {
+                @for scan in scans {
+                    @let download_url = format!("/scans/download/{}", scan.id);
+                    tr {
+                        td { (scan.id_as_utc) }
+                        td {
+                            form action=(download_url) method="get" {
+                                button { "Download" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -141,7 +172,12 @@ async fn new_scan(State(db): StateDb) -> Response {
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         Ok(scan) => html! {
             h1 { "Neuer Scan" }
-            p { "Bitte Stapel mit Frontseiten nach oben einlegen, danach \"Weiter\" drücken" }
+            ul {
+                li { "Bitte Stapel mit Frontseiten nach oben einlegen" }
+                li { "Kopf der Seiten muss Richtung Heizung zeigen"}
+                li { "Dritter und vierter Knopf von links müssen leuchten (grün, weiß)" }
+                li { "Weiter drücken" }
+            }
             p { a href={ "/scans/front/" (scan.id) } { "Weiter" } }
         }
         .into_response(),
@@ -168,7 +204,18 @@ async fn scan_front(State(db): StateDb, Path(id): Path<ScanId>) -> Response {
     if front_done {
         html! {
             h1 { "Scannen der Frontseiten" }
-            p { "Scan der Frontseiten abgeschlossen. Entweder jetzt Rückseiten nach oben einlegen (und \"Weiter\" drücken), oder \"Fertig\" drücken, falls keine Rückseiten vorhanden sind." }
+            p { "Scan der Frontseiten abgeschlossen. Jetzt gibt es zwei Optionen:" }
+            ol {
+                li { "Keine Rückseiten vorhanden => Fertig drücken" }
+                li { "Rückseiten vorhanden" }
+                ul {
+                    li { "Stapel wieder einlegen, diesmal Rückseiten nach oben (also so wie der Stapel rauskam)" }
+                    li { "Aber der Seitenkopf muss wieder Richtung Heizung zeigen => einmal drehen" }
+                    li { "Warten, bis das rote X nicht mehr leuchtet" }
+                    li { "Warten, bis dritter und vierter Knopf von links wieder leuchten (grün, weiß)" }
+                    li { "Weiter drücken" }
+                }
+            }
             p { a href={ "/scans/back/" (scan.id) } { "Weiter" } }
             p { a href={ "/scans/postproc/" (scan.id) } { "Fertig" } }
         }.into_response()
@@ -200,12 +247,7 @@ async fn scan_back(State(db): StateDb, Path(id): Path<ScanId>) -> Response {
         _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     if back_done {
-        html! {
-            h1 { "Scannen der Rückseiten" }
-            p { "Abgeschlossen, bitte \"Weiter\" drücken" }
-            p { a href={ "/scans/postproc/" (scan.id) } { "Weiter" } }
-        }
-        .into_response()
+        Redirect::to(&format!("/scans/postproc/{}", scan.id)).into_response()
     } else {
         html! {
             (head_with_refresh(1))
@@ -234,19 +276,35 @@ async fn scan_postproc(State(db): StateDb, Path(id): Path<ScanId>) -> Response {
         _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     if postproc_done {
-        html! {
-            h1 { "Nachbearbeitung" }
-            p { "Abgeschlossen, bitte \"Weiter\" drücken" }
-            p { a href={ "/scans" } { "Weiter" } }
-        }
-        .into_response()
+        Redirect::to("/scans").into_response()
     } else {
         html! {
             (head_with_refresh(1))
             h1 { "Nachbearbeitung" }
-            p { "Bitte warten ..." }
+            p { "Bitte warten ... (dauert schon ne Weile)" }
         }
         .into_response()
+    }
+}
+
+async fn download(State(db): StateDb, Path(id): Path<ScanId>) -> Response {
+    let scan = match db.get_scan(&id) {
+        Some(s) => s,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match tokio::fs::read(scan.path.join("scan.pdf")).await {
+        Ok(contents) => (
+            [
+                (header::CONTENT_TYPE, "application/pdf"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"scan.pdf\"",
+                ),
+            ],
+            contents,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -260,18 +318,77 @@ fn head_with_refresh(interval: u16) -> Markup {
 
 fn start_scan_front(id: ScanId, db: Arc<ScanDb>) {
     std::thread::spawn(move || {
-        db.set_status(id, Status::FrontDone).unwrap();
+        if let Some(path) = db.get_path(&id) {
+            if let Ok(output) = Command::new("smarter-scan-do")
+                .arg(path)
+                .arg("front")
+                .output()
+            {
+                if ExitStatus::success(&output.status) {
+                    db.set_status(id, Status::FrontDone).unwrap();
+                } else {
+                    println!("Scan front error log:");
+                    println!("---------------------");
+                    println!("{}", String::from_utf8(output.stderr).unwrap());
+                    db.set_status(id, Status::Failed).unwrap();
+                }
+            } else {
+                db.set_status(id, Status::Failed).unwrap();
+            }
+        }
     });
 }
 
 fn start_scan_back(id: ScanId, db: Arc<ScanDb>) {
     std::thread::spawn(move || {
-        db.set_status(id, Status::BackDone).unwrap();
+        if let Some(path) = db.get_path(&id) {
+            if let Ok(output) = Command::new("smarter-scan-do")
+                .arg(path)
+                .arg("back")
+                .output()
+            {
+                if ExitStatus::success(&output.status) {
+                    db.set_status(id, Status::BackDone).unwrap();
+                } else {
+                    println!("Scan back error log:");
+                    println!("---------------------");
+                    println!("{}", String::from_utf8(output.stderr).unwrap());
+                    db.set_status(id, Status::Failed).unwrap();
+                }
+            } else {
+                db.set_status(id, Status::Failed).unwrap();
+            }
+        }
     });
 }
 
 fn start_post_proc(id: ScanId, db: Arc<ScanDb>) {
     std::thread::spawn(move || {
-        db.set_status(id, Status::Done).unwrap();
+        if let Some(path) = db.get_path(&id) {
+            let mut cmd = Command::new("smarter-scan-post");
+            cmd.arg("-o");
+            cmd.arg(path.join("scan.pdf"));
+            std::fs::read_dir(&path).unwrap().for_each(|p| {
+                if let Ok(e) = p {
+                    if let Ok(t) = e.file_type() {
+                        if FileType::is_file(&t) {
+                            cmd.arg(e.path());
+                        }
+                    }
+                }
+            });
+            if let Ok(output) = cmd.output() {
+                println!("Postprocess log:");
+                println!("---------------");
+                println!("{}", String::from_utf8(output.stdout).unwrap());
+                if ExitStatus::success(&output.status) {
+                    db.set_status(id, Status::Done).unwrap();
+                } else {
+                    db.set_status(id, Status::Failed).unwrap();
+                }
+            } else {
+                db.set_status(id, Status::Failed).unwrap();
+            }
+        }
     });
 }

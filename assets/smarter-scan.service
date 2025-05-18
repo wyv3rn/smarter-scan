@@ -1,0 +1,9 @@
+[Unit]
+Description=Smarter Scan
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/smarter-scan --address 0.0.0.0:8081 --database /var/lib/smarter-scan-db
+
+[Install]
+WantedBy=multi-user.target
